@@ -435,3 +435,118 @@ LIMIT 10;
    FROM pedido
    WHERE cliente_id = 8;
    ```
+
+## 5. Edição e Auditoria via `usuario_log`
+
+Este item demonstra como o sistema registra automaticamente alterações em usuários, produtos e serviços na tabela `usuario_log`, no formato CSV, por meio de triggers (`AFTER UPDATE`). O log permite auditoria completa das alterações realizadas.
+
+---
+
+### 5.1. Atualização de Perfil de Usuário
+
+```sql
+-- Exemplo 5.1: Atualizar nome e endereço de um usuário
+UPDATE usuario
+SET nome = 'Luciano P. Silva',
+    endereco = 'Rua Alpha, 101 - Campinas'
+WHERE id = 1;
+```
+
+**Efeito Esperado:**
+
+* A trigger `trg_usuario_after_update` será ativada.
+* Será inserido um registro na tabela `usuario_log` com:
+
+  * `usuario_id = 1`
+  * `tipo = 'atualizacao_perfil'`
+  * `descricao` com os valores antigos e novos no formato CSV.
+
+**Verificação:**
+
+```sql
+SELECT id, usuario_id, tipo, descricao
+FROM usuario_log
+WHERE tipo = 'atualizacao_perfil'
+ORDER BY id DESC
+LIMIT 1;
+```
+
+**Exemplo de Saída:**
+
+```
++----+-------------+---------------------+--------------------------------------------------------------------------+
+| id | usuario_id  | tipo                | descricao                                                                |
++----+-------------+---------------------+--------------------------------------------------------------------------+
+| 42 |           1 | atualizacao_perfil  | id,nome,email,cpf_cnpj,endereco,ativo\n1,Luciano Pereira,...             |
++----+-------------+---------------------+--------------------------------------------------------------------------+
+```
+
+---
+
+### 5.2. Atualização de Produto
+
+```sql
+-- Exemplo 5.2: Atualizar preço e ativar um produto
+UPDATE produto
+SET preco = 370000,
+    ativo = TRUE
+WHERE id = 1;
+```
+
+**Efeito Esperado:**
+
+* A trigger `trg_produto_after_update` será ativada.
+* Será gerado um log em `usuario_log` com:
+
+  * `usuario_id = 0` (sistema ou operador indefinido)
+  * `tipo = 'atualizacao_produto'`
+  * CSV com dados antigos e novos.
+
+**Verificação:**
+
+```sql
+SELECT id, usuario_id, tipo, descricao
+FROM usuario_log
+WHERE tipo = 'atualizacao_produto'
+ORDER BY id DESC
+LIMIT 1;
+```
+
+---
+
+### 5.3. Atualização de Serviço
+
+```sql
+-- Exemplo 5.3: Alterar nome e descrição de um serviço
+UPDATE servico
+SET nome = 'Reparo de Hardware Avançado',
+    descricao = 'Substituição de peças e manutenção especializada'
+WHERE id = 4;
+```
+
+**Efeito Esperado:**
+
+* A trigger `trg_servico_after_update` será acionada.
+* Registro criado em `usuario_log` com:
+
+  * `usuario_id = 0`
+  * `tipo = 'atualizacao_servico'`
+  * Campo `descricao` com CSV de alterações.
+
+---
+
+### 5.4. Verificação Completa do Log
+
+```sql
+SELECT *
+FROM usuario_log
+ORDER BY id DESC
+LIMIT 10;
+```
+
+**Colunas disponíveis:**
+
+* `id`: ID do log
+* `usuario_id`: Quem realizou a ação (ou `0`)
+* `tipo`: Tipo de alteração (perfil/produto/serviço)
+* `descricao`: CSV com antes/depois
