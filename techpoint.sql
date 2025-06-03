@@ -81,7 +81,7 @@ create table usuario (
 --                - atualizacao_produto
 --                - atualizacao_servico
 --   descricao  : Texto em formato CSV que armazena valores antes/depois da alteração
---                Exemplo: “produto_id,nome,descricao,preco\n1,Notebook A,Notebook 8GB,350000”
+--                Exemplo: “produto_id,nome,descricao,preco\n1,Notebook A,Notebook 8GB,350000,1,Notebook B,Notebook 8GB,350000”
 create table usuario_log (
     id int auto_increment primary key,
     usuario_id int not null,
@@ -500,25 +500,34 @@ create function monta_csv_log(
 returns text
 deterministic
 begin
-
     declare csv_log text default '';
+    declare linha_old text default '';
+    declare linha_new text default '';
     declare old_value text;
     declare new_value text;
     declare i int default 0;
+    declare n int;
 
-    -- Monta o cabeçalho do CSV
-    set csv_log = concat(header, '\n');
+    set n = json_length(old_values);
 
-    -- Percorre os valores antigos e novos
-    while i < json_length(old_values) do
+    -- Percorre os valores antigos e novos ao mesmo tempo
+    while i < n do
         set old_value = json_unquote(json_extract(old_values, concat('$[', i, ']')));
         set new_value = json_unquote(json_extract(new_values, concat('$[', i, ']')));
-        set csv_log = concat(csv_log, format_csv_string(old_value), ',', format_csv_string(new_value), '\n');
+        if i = n - 1 then
+            set linha_old = concat(linha_old, format_csv_string(old_value));
+            set linha_new = concat(linha_new, format_csv_string(new_value));
+        else
+            set linha_old = concat(linha_old, format_csv_string(old_value), ',');
+            set linha_new = concat(linha_new, format_csv_string(new_value), ',');
+        end if;
         set i = i + 1;
     end while;
 
+    -- Monta o CSV final
+    set csv_log = concat(header, '\\n', linha_old, '\\n', linha_new);
+
     return csv_log;
-    
 end $$
 delimiter ;
 
@@ -696,36 +705,60 @@ create procedure realiza_venda(
     p_itens_json longtext
 )
 begin
+    -- Variável para capturar a mensagem de erro original
     declare v_pedido_id int;
+    declare message_err_text text;
 
-    -- Cria tabela temporária para armazenar os itens com preço
-    create temporary table if not exists tmp_itens (
+    -- Handler único: captura qualquer exceção SQL (incluindo SIGNAL)
+    declare exit handler for sqlexception
+    begin
+        -- Reverte todas as alterações feitas até aqui
+        rollback;
+
+        -- Relança um SIGNAL genérico (45000), mas com a mensagem original se existir, senão mensagem padrão
+        if message_err_text is not null then
+            signal sqlstate '45000' set message_text = message_err_text;
+        else
+            signal sqlstate '45000' set message_text = 'Não foi possível realizar a venda';
+        end if;
+    end;
+
+    -- Inicia a transação
+    start transaction;
+
+
+    -- delete a tabela temporária se já existir
+    drop temporary table if exists tmp_itens;
+
+    -- Cria a tabela temporária para armazenar itens com preço
+    create temporary table tmp_itens (
         produto_id int,
         servico_id int,
         quantidade int,
-        preco_unitario int
+        preco_unitario decimal(10,2)
     );
 
-    -- Insere os itens já com o preço calculado
+    -- Insere na temp table cada item do JSON, já buscando o preço correto
     insert into tmp_itens (produto_id, servico_id, quantidade, preco_unitario)
     select
         ijt.produto_id,
         ijt.servico_id,
         ijt.quantidade,
         case
-            when ijt.produto_id is not null then (select preco from produto where id = ijt.produto_id)
+            when ijt.produto_id is not null 
+                then (select preco from produto where id = ijt.produto_id)
             else (select preco from servico where id = ijt.servico_id)
         end as preco_unitario
     from json_table(
         p_itens_json,
         '$[*]' columns (
-            produto_id int path '$.produto_id',
-            servico_id int path '$.servico_id',
-            quantidade int path '$.quantidade'
+            produto_id int        path '$.produto_id',
+            servico_id int        path '$.servico_id',
+            quantidade int        path '$.quantidade'
         )
     ) as ijt;
 
-    -- Verifica se há produto com estoque insuficiente
+    -- Verifica se algum produto está com estoque insuficiente
     if exists (
         select 1
         from tmp_itens ti
@@ -733,15 +766,17 @@ begin
         where ti.produto_id is not null
           and ti.quantidade > p.estoque
     ) then
-        signal sqlstate '45000' set message_text = 'Erro: Produto com estoque insuficiente para a venda.';
+        -- Esse SIGNAL será capturado pelo handler, que vai fazer rollback e relançar
+        set message_err_text = 'Produto com estoque insuficiente para a venda.';
+        signal sqlstate '45000' set message_text = message_err_text;
     end if;
 
-    -- 1. Insere pedido com total = 0 temporário
+    -- 1. Insere o pedido com total = 0 temporário
     insert into pedido (cliente_id, usuario_id, total)
     values (p_cliente_id, p_usuario_id, 0);
     set v_pedido_id = last_insert_id();
 
-    -- 2. Insere os itens a partir do JSON
+    -- 2. Insere os itens na tabela item_pedido
     insert into item_pedido (pedido_id, produto_id, servico_id, quantidade, preco_unitario)
     select
         v_pedido_id, produto_id, servico_id, quantidade, preco_unitario
@@ -750,13 +785,16 @@ begin
     -- 3. A trigger trg_item_pedido_after_insert cuida da atualização de estoque
     -- Portanto, nenhuma lógica adicional de estoque aqui
 
-    -- 4. Atualiza o total do pedido
+    -- 4. Atualiza o total do pedido (via função calcula_total_pedido)
     update pedido
     set total = calcula_total_pedido(v_pedido_id)
     where id = v_pedido_id;
 
     -- Limpa a tabela temporária
     drop temporary table if exists tmp_itens;
+
+    -- Confirma todas as alterações
+    commit;
 end $$
 delimiter ;
 
@@ -879,21 +917,21 @@ begin
             'atualizacao_perfil',
             monta_csv_log(
                 'id,nome,email,cpf_cnpj,endereco,ativo',
-                json_object(
-                    'id', old.id,
-                    'nome', old.nome,
-                    'email', old.email,
-                    'cpf_cnpj', old.cpf_cnpj,
-                    'endereco', old.endereco,
-                    'ativo', old.ativo
+                json_array(
+                    old.id,
+                    old.nome,
+                    old.email,
+                    old.cpf_cnpj,
+                    old.endereco,
+                    old.ativo
                 ),
-                json_object(
-                    'id', new.id,
-                    'nome', new.nome,
-                    'email', new.email,
-                    'cpf_cnpj', new.cpf_cnpj,
-                    'endereco', new.endereco,
-                    'ativo', new.ativo
+                json_array(
+                    new.id,
+                    new.nome,
+                    new.email,
+                    new.cpf_cnpj,
+                    new.endereco,
+                    new.ativo
                 )
             )
         );
@@ -930,19 +968,19 @@ begin
             'atualizacao_produto',
             monta_csv_log(
                 'id,nome,descricao,preco,ativo',
-                json_object(
-                    'id', old.id,
-                    'nome', old.nome,
-                    'descricao', ifnull(old.descricao, ''),
-                    'preco', old.preco,
-                    'ativo', old.ativo
+                json_array(
+                    old.id,
+                    old.nome,
+                    ifnull(old.descricao, ''),
+                    old.preco,
+                    old.ativo
                 ),
-                json_object(
-                    'id', new.id,
-                    'nome', new.nome,
-                    'descricao', ifnull(new.descricao, ''),
-                    'preco', new.preco,
-                    'ativo', new.ativo
+                json_array(
+                    new.id,
+                    new.nome,
+                    ifnull(new.descricao, ''),
+                    new.preco,
+                    new.ativo
                 )
             )
         );
@@ -976,19 +1014,19 @@ begin
             'atualizacao_servico',
             monta_csv_log(
                 'id,nome,descricao,preco,ativo',
-                json_object(
-                    'id', old.id,
-                    'nome', old.nome,
-                    'descricao', ifnull(old.descricao, ''),
-                    'preco', old.preco,
-                    'ativo', old.ativo
+                json_array(
+                    old.id,
+                    old.nome,
+                    ifnull(old.descricao, ''),
+                    old.preco,
+                    old.ativo
                 ),
-                json_object(
-                    'id', new.id,
-                    'nome', new.nome,
-                    'descricao', ifnull(new.descricao, ''),
-                    'preco', new.preco,
-                    'ativo', new.ativo
+                json_array(
+                    new.id,
+                    new.nome,
+                    ifnull(new.descricao, ''),
+                    new.preco,
+                    new.ativo
                 )
             )
         );
@@ -1102,7 +1140,7 @@ order by total_vendas desc;
 --   cliente_nome : Nome do cliente
 --   total_gasto  : Soma dos valores do campo total de todos os pedidos desse cliente
 create view vw_clientes_total_gasto as
-    SELECT
+    select
         c.id as cliente_id,
         c.nome as cliente_nome,
         sum(p.total) as total_gasto
@@ -1111,7 +1149,7 @@ create view vw_clientes_total_gasto as
             join
         pedido p on p.cliente_id = c.id
     where
-        c.ativo = true
+        c.ativo = TRUE
     group by c.id , c.nome
     order by total_gasto desc;
 
